@@ -4,6 +4,7 @@ from typing import Any
 
 from esphome import config_validation as cv
 from esphome.automation import Trigger, validate_automation
+from esphome.components.binary_sensor import DOMAIN as BINARY_SENSOR_DOMAIN
 from esphome.components.mapping import mapping_class
 from esphome.components.time import RealTimeClock
 from esphome.config_validation import prepend_path
@@ -25,7 +26,7 @@ from esphome.const import (
     CONF_Y,
 )
 from esphome.core import TimePeriod
-from esphome.core.config import StartupTrigger
+from esphome.core.config import StartupCallback
 from esphome.schema_extractors import (
     SCHEMA_EXTRACT,
     EnableSchemaExtraction,
@@ -148,7 +149,8 @@ PRESS_TIME = cv.All(
 ENCODER_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.All(
-            cv.declare_id(LVEncoderListener), cv.requires_component("binary_sensor")
+            cv.declare_id(LVEncoderListener),
+            cv.requires_component(BINARY_SENSOR_DOMAIN),
         ),
         cv.Optional(CONF_GROUP): cv.declare_id(lv_group_t),
         cv.Optional(df.CONF_INITIAL_FOCUS): cv.All(
@@ -389,7 +391,6 @@ SET_STATE_SCHEMA = cv.Schema(
 )
 # Setting object flags
 FLAG_SCHEMA = cv.Schema({cv.Optional(flag): lvalid.lv_bool for flag in df.OBJ_FLAGS})
-FLAG_LIST = cv.ensure_list(df.LV_OBJ_FLAG.one_of)
 
 VALUE_TRIGGER_SCHEMA = {
     cv.Optional(CONF_TRIGGER, default=CONF_ON_VALUE): cv.one_of(
@@ -486,7 +487,7 @@ def automation_schema(typ: LvType) -> dict[Any, Any]:
             for event in events
         },
         cv.Optional(CONF_ON_BOOT): _lazy_validate_automation(
-            {cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(StartupTrigger)}
+            {cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(StartupCallback)}
         ),
     }
 

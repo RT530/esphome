@@ -1,6 +1,12 @@
 #pragma once
 
+#include "esphome/core/defines.h"
+#ifdef USE_BINARY_SENSOR
 #include "esphome/components/binary_sensor/binary_sensor.h"
+#endif
+#ifdef USE_SENSOR
+#include "esphome/components/sensor/sensor.h"
+#endif
 #include "esphome/components/socket/tcp_client_link.h"
 #ifdef USE_SOCKET_TCP_LISTENER
 #include "esphome/components/socket/tcp_listener.h"
@@ -14,13 +20,20 @@ namespace esphome::tcp_uart {
 
 /// TCP client or server presented as a UART. Bytes are copied unchanged.
 class TcpUart : public uart::UARTComponent, public Component {
+#ifdef USE_BINARY_SENSOR
+  SUB_BINARY_SENSOR(connected)
+#endif
+#ifdef USE_SENSOR
+  SUB_SENSOR(disconnects)
+#endif
+
  public:
   TcpUart() { this->rx_buffer_size_ = RX_BUFFER_SIZE; }
 
   void set_host(const char *host) { this->link_.set_host(host); }
   void set_port(uint16_t port) { this->link_.set_port(port); }
   void set_reconnect_interval(uint32_t ms) { this->link_.set_reconnect_interval(ms); }
-  void set_connected_sensor(binary_sensor::BinarySensor *sensor) { this->connected_sensor_ = sensor; }
+  void set_idle_timeout(uint32_t ms) { this->link_.set_idle_timeout(ms); }
 #ifdef USE_SOCKET_TCP_LISTENER
   void set_server(bool server) { this->server_ = server; }
 #ifdef USE_SOCKET_IPV4_ALLOW
@@ -44,6 +57,7 @@ class TcpUart : public uart::UARTComponent, public Component {
   bool is_connected() override { return this->link_.connected(); }
 #if defined(USE_ESP8266) || defined(USE_ESP32)
   void load_settings(bool dump_config) override {}
+  using UARTComponent::load_settings;  // also bring in the no-arg overload for convenience
 #endif
 
  protected:
@@ -57,13 +71,15 @@ class TcpUart : public uart::UARTComponent, public Component {
 #ifdef USE_SOCKET_TCP_LISTENER
   socket::TcpListener listener_;
 #endif
-  binary_sensor::BinarySensor *connected_sensor_{nullptr};
+#ifdef USE_SENSOR
+  uint32_t disconnects_{0};
+#endif
   uint32_t last_drop_log_ms_{0};
   // rx_[rx_start_, rx_end_) holds unread bytes; read_socket_() compacts to the front.
   uint16_t rx_start_{0};
   uint16_t rx_end_{0};
   bool server_{false};
-  // The link state loop() saw last; edges clear rx_ and publish the sensor.
+  // The link state loop() saw last; edges publish the sensor, the up edge clears rx_.
   bool link_was_up_{false};
   // A read stopped before EAGAIN. ready() stays false until new data arrives.
   bool rx_pending_{false};

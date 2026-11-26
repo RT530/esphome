@@ -6,12 +6,13 @@ import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import ANY, call, patch
 
 import platformdirs
 import pytest
 
-from esphome.components.nrf52 import _resolve_toolchain
+from esphome.components.nrf52 import _resolve_toolchain, framework
 from esphome.components.nrf52.framework import (
     _PLATFORMIO_PENV_REQUIREMENTS,
     _REQUIREMENTS,
@@ -19,15 +20,13 @@ from esphome.components.nrf52.framework import (
     TOOLCHAIN_VERSION,
     _get_penv_site_packages,
     _get_platformio_penv_path,
-    _get_toolchain_platform_info,
     _install_toolchain,
-    _needs_venv_rebuild,
-    _wanted_west_projects,
     check_and_install,
     get_build_env,
     get_sdk_nrf_tools_path,
     include_west_project,
     setup_platformio_python_env,
+    wanted_west_projects,
 )
 from esphome.components.zephyr.const import KEY_SYSBUILD, KEY_ZEPHYR
 import esphome.config_validation as cv
@@ -50,31 +49,6 @@ def _isolate_sdk_nrf_install_path(
     env themselves.
     """
     monkeypatch.setenv("ESPHOME_SDK_NRF_PREFIX", str(tmp_path / "sdk_nrf_install"))
-
-
-@pytest.mark.parametrize(
-    ("system", "machine", "expected"),
-    [
-        # default — no branch hit
-        ("Linux", "x86_64", ("linux", "x86_64", "tar.xz")),
-        # arm64 → aarch64 rename
-        ("Linux", "arm64", ("linux", "aarch64", "tar.xz")),
-        # darwin → macos rename only
-        ("Darwin", "x86_64", ("macos", "x86_64", "tar.xz")),
-        # both renames apply
-        ("Darwin", "arm64", ("macos", "aarch64", "tar.xz")),
-        # windows forces x86_64 + 7z; arm64 rename is overwritten
-        ("Windows", "arm64", ("windows", "x86_64", "7z")),
-    ],
-)
-def test_get_toolchain_platform_info(
-    system: str, machine: str, expected: tuple[str, str, str]
-) -> None:
-    with (
-        patch("platform.system", return_value=system),
-        patch("platform.machine", return_value=machine),
-    ):
-        assert _get_toolchain_platform_info() == expected
 
 
 # ---------------------------------------------------------------------------
@@ -111,10 +85,21 @@ def mock_nrf52_ops():
     """Patch all heavy I/O operations used by check_and_install."""
     with (
         patch("esphome.components.nrf52.framework.rmdir") as mock_rmdir,
+        # The toolchain install lives in the shared Zephyr SDK installer
+        patch("esphome.components.zephyr.sdk_install.rmdir", mock_rmdir),
         patch("esphome.components.nrf52.framework.create_venv") as mock_create_venv,
         patch(
             "esphome.components.nrf52.framework.run_command_ok", return_value=True
         ) as mock_run_cmd,
+        # The penv build lives in the shared Zephyr framework helpers
+        patch("esphome.components.zephyr.framework_helpers.rmdir", mock_rmdir),
+        patch(
+            "esphome.components.zephyr.framework_helpers.create_venv",
+            mock_create_venv,
+        ),
+        patch(
+            "esphome.components.zephyr.framework_helpers.run_command_ok", mock_run_cmd
+        ),
         # download_and_extract resolves its internals in framework_helpers,
         # so the download/extract seams are patched there.
         patch(
@@ -539,7 +524,7 @@ class TestCheckAndInstall:
         """Zephyr 4.1 moved the Cortex-M core headers to the cmsis_6 module."""
         CORE.data[KEY_CORE] = {KEY_FRAMEWORK_VERSION: Version.parse(sdk_version)}
 
-        assert ("cmsis_6" in _wanted_west_projects()) is has_cmsis_6
+        assert ("cmsis_6" in wanted_west_projects()) is has_cmsis_6
 
     def test_default_projects_never_read_the_stamp(
         self,
@@ -792,12 +777,12 @@ class TestCheckAndInstall:
         nrf52_dirs: SimpleNamespace,
         mock_nrf52_ops: SimpleNamespace,
     ) -> None:
-        """download_from_mirrors receives VERSION + platform triple from _get_toolchain_platform_info."""
+        """download_from_mirrors receives VERSION + platform triple from get_sdk_host_info."""
         _mark_venv_ready(nrf52_dirs.python_env)
         (nrf52_dirs.framework / ".ready").touch()
 
         with patch(
-            "esphome.components.nrf52.framework._get_toolchain_platform_info",
+            "esphome.components.zephyr.sdk_install.get_sdk_host_info",
             return_value=("linux", "x86_64", "tar.xz"),
         ):
             check_and_install()
@@ -1121,6 +1106,22 @@ def test_get_build_env_with_ccache(
     assert env["CCACHE_DEPEND"] == "1"
     assert env["CCACHE_BASEDIR"] == str((tmp_path / "build").resolve())
     assert "CCACHE_DISABLE" not in env
+    # Only the per build map entry leaves the hash; user maps stay in
+    assert env["CCACHE_IGNOREOPTIONS"] == (
+        f"-fmacro-prefix-map={(tmp_path / 'build' / 'zephyr').as_posix()}"
+        "=CMAKE_SOURCE_DIR"
+    )
+
+
+def test_get_build_env_skips_the_map_entry_on_whitespace(
+    nrf52_dirs: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The ignore list splits on spaces; a spaced path cannot be
+    expressed, so the entry is left hashed rather than emitted broken."""
+    monkeypatch.delenv("CCACHE_IGNOREOPTIONS", raising=False)
+    CORE.build_path = tmp_path / "with space" / "build"
+    env = get_build_env("/usr/bin/ccache")
+    assert "CCACHE_IGNOREOPTIONS" not in env
 
 
 def test_get_build_env_sdk_3_4_0_uses_toolchain_root(
@@ -1150,7 +1151,7 @@ def test_install_toolchain_keeps_other_live_toolchain_leftovers(
         leftover.write_text("")
 
     with patch(
-        "esphome.components.nrf52.framework.download_and_extract",
+        "esphome.components.zephyr.sdk_install.download_and_extract",
         side_effect=lambda *args, **kwargs: args[3].mkdir(parents=True),
     ):
         _install_toolchain()
@@ -1159,6 +1160,75 @@ def test_install_toolchain_keeps_other_live_toolchain_leftovers(
     assert other.exists()
     assert not retired.exists()
     assert (toolchains / "1.0.1" / ".ready").exists()
+
+
+@pytest.mark.parametrize(
+    ("ncs", "sdk", "toolchain_url", "toolchain_dir"),
+    [
+        (
+            "3.3.0",
+            "0.17.4",
+            "toolchain_linux-x86_64_arm-zephyr-eabi.tar.xz",
+            ("arm-zephyr-eabi",),
+        ),
+        (
+            "3.4.0",
+            "1.0.1",
+            "toolchain_gnu_linux-x86_64_arm-zephyr-eabi.tar.xz",
+            ("gnu", "arm-zephyr-eabi"),
+        ),
+    ],
+)
+def test_install_toolchain_downloads_the_arm_toolchain(
+    setup_core: Path,
+    ncs: str,
+    sdk: str,
+    toolchain_url: str,
+    toolchain_dir: tuple[str, ...],
+) -> None:
+    """The exact archives nrf52 installs, and where they are extracted."""
+    CORE.data[KEY_CORE] = {KEY_FRAMEWORK_VERSION: Version.parse(ncs)}
+    toolchains = get_sdk_nrf_tools_path() / "toolchains"
+    base = f"https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v{sdk}/"
+    downloads: list[tuple[list[str], Path, Path]] = []
+
+    def _download(
+        mirrors: list[str],
+        substitutions: dict[str, str],
+        archive: Path,
+        extract_dir: Path,
+        **kwargs: Any,
+    ) -> None:
+        downloads.append(
+            ([m.format(**substitutions) for m in mirrors], archive, extract_dir)
+        )
+        extract_dir.mkdir(parents=True, exist_ok=True)
+
+    with (
+        patch(
+            "esphome.components.zephyr.sdk_install.download_and_extract",
+            side_effect=_download,
+        ),
+        patch(
+            "esphome.components.zephyr.sdk_install.get_sdk_host_info",
+            return_value=("linux", "x86_64", "tar.xz"),
+        ),
+    ):
+        _install_toolchain()
+
+    assert downloads == [
+        (
+            [f"{base}zephyr-sdk-{sdk}_linux-x86_64_minimal.tar.xz"],
+            toolchains / f"{sdk}.minimal.archive",
+            toolchains / sdk,
+        ),
+        (
+            [f"{base}{toolchain_url}"],
+            toolchains / f"{sdk}.toolchain.archive",
+            toolchains.joinpath(sdk, *toolchain_dir),
+        ),
+    ]
+    assert (toolchains / sdk / ".ready").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1202,51 +1272,111 @@ def testget_tools_path_default_is_global_cache(
     assert get_sdk_nrf_tools_path() == expected
 
 
-def test_needs_venv_rebuild_gates(tmp_path: Path) -> None:
-    """The shared penv gate rebuilds on any missing or stale piece."""
-    penv = tmp_path / "penv"
-    penv.mkdir()
-    python = penv / "python"
-    sentinel = penv / ".ready"
-    good_hash = "abc123"
-
-    # Nothing in place yet
-    assert _needs_venv_rebuild(python, sentinel, good_hash)
-
-    python.write_text("")
-    # Interpreter present but no sentinel
-    assert _needs_venv_rebuild(python, sentinel, good_hash)
-
-    sentinel.write_text(good_hash, encoding="utf-8")
-    # Everything in place
-    assert not _needs_venv_rebuild(python, sentinel, good_hash)
-
-    # Stale requirements hash
-    assert _needs_venv_rebuild(python, sentinel, "otherhash")
-
-
-@pytest.mark.skipif(
-    sys.platform == "win32", reason="symlink creation needs privileges on Windows"
-)
-def test_needs_venv_rebuild_on_dangling_interpreter_symlink(tmp_path: Path) -> None:
-    """A cached venv restored after a host interpreter upgrade has a
-    bin/python symlink whose target is gone; the valid sentinel must not
-    mask it."""
-    penv = tmp_path / "penv"
-    penv.mkdir()
-    python = penv / "python"
-    sentinel = penv / ".ready"
-    sentinel.write_text("abc123", encoding="utf-8")
-    python.symlink_to(tmp_path / "hostedtoolcache" / "3.12.14" / "python3")
-    assert python.is_symlink()
-    assert not python.exists()
-
-    assert _needs_venv_rebuild(python, sentinel, "abc123")
-
-
 def test_resolve_toolchain_rejects_unsupported() -> None:
     """A --toolchain nRF52 cannot serve fails instead of degrading silently."""
 
     CORE.toolchain = Toolchain.ARDUINO
     with pytest.raises(cv.Invalid, match="Unsupported toolchain 'arduino'"):
         _resolve_toolchain({})
+
+
+PYOCD_NRF54LM20A_BEFORE = """\
+from ..family.target_nRF54L import NRF54L
+
+FLASH_ALGO = {
+    'load_address' : 0x20000000,
+    'instructions': [
+    0xe7fdbe00,
+    0x68134a02, 0xd1fc2b01, 0x46c04770, 0x5004e400, 0x47702000, 0x47702000, 0x2501b570, 0x60254c05,
+    ],
+    'page_size' : 0x4,
+    'sector_sizes': (
+        (0x0, 0x1fd000),
+        (0xffd000, 0x1000),
+    )
+}
+
+class NRF54LM20A(NRF54L):
+    pass
+"""
+
+
+def test_patch_pyocd_nrf54lm20a_flash_algo(tmp_path: Path) -> None:
+    """PyOCD's faulting nRF54LM20A flash algorithm is replaced by the fixed one."""
+    target = (
+        framework._get_penv_site_packages(tmp_path)
+        / "pyocd"
+        / "target"
+        / "builtin"
+        / "target_nRF54LM20A.py"
+    )
+    target.parent.mkdir(parents=True)
+    target.write_text(PYOCD_NRF54LM20A_BEFORE)
+    framework._patch_pyocd_nrf54lm20a_flash_algo(tmp_path)
+    patched = target.read_text()
+    assert framework._PYOCD_NRF54LM20A_FLASH_ALGO in patched
+    assert "0x68134a02" not in patched
+    assert patched.startswith("from ..family.target_nRF54L import NRF54L\n\n")
+    assert patched.endswith("\nclass NRF54LM20A(NRF54L):\n    pass\n")
+    framework._patch_pyocd_nrf54lm20a_flash_algo(tmp_path)  # idempotent
+    assert target.read_text() == patched
+    framework._patch_pyocd_nrf54lm20a_flash_algo(tmp_path / "absent")  # tolerant
+
+
+def test_unpatched_pyocd_nrf54lm20a_target(tmp_path: Path) -> None:
+    """The upload error names pyOCD's target file until the fix is in it."""
+    target = framework._pyocd_nrf54lm20a_target(tmp_path)
+    with (
+        patch.object(framework, "_get_version_str", return_value="v3.4.0"),
+        patch.object(framework, "_get_python_env_path", return_value=tmp_path),
+    ):
+        assert framework.unpatched_pyocd_nrf54lm20a_target() is None  # absent
+        target.parent.mkdir(parents=True)
+        target.write_text(PYOCD_NRF54LM20A_BEFORE)
+        assert framework.unpatched_pyocd_nrf54lm20a_target() == target
+        framework._patch_pyocd_nrf54lm20a_flash_algo(tmp_path)
+        assert framework.unpatched_pyocd_nrf54lm20a_target() is None
+
+
+def test_patch_pyocd_nrf54lm20a_leaves_another_algorithm_alone(tmp_path: Path) -> None:
+    """A newer pyOCD's algorithm, without the faulting instructions, is not replaced."""
+    target = framework._pyocd_nrf54lm20a_target(tmp_path)
+    target.parent.mkdir(parents=True)
+    newer = PYOCD_NRF54LM20A_BEFORE.replace("0x68134a02", "0x12345678")
+    target.write_text(newer)
+    framework._patch_pyocd_nrf54lm20a_flash_algo(tmp_path)
+    assert target.read_text() == newer
+    with (
+        patch.object(framework, "_get_version_str", return_value="v3.4.0"),
+        patch.object(framework, "_get_python_env_path", return_value=tmp_path),
+    ):
+        assert framework.unpatched_pyocd_nrf54lm20a_target() is None
+
+
+def test_patch_pyocd_nrf54lm20a_warns_on_an_unknown_layout(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The faulting algorithm in a layout the patch cannot find is left as it is."""
+    target = framework._pyocd_nrf54lm20a_target(tmp_path)
+    target.parent.mkdir(parents=True)
+    indented = PYOCD_NRF54LM20A_BEFORE.replace("FLASH_ALGO = {", "  FLASH_ALGO = {")
+    target.write_text(indented)
+    framework._patch_pyocd_nrf54lm20a_flash_algo(tmp_path)
+    assert target.read_text() == indented
+    assert "Could not patch pyOCD's nRF54LM20A flash algorithm" in caplog.text
+
+
+def test_pyocd_target_found_in_an_env_of_another_python_version(
+    tmp_path: Path,
+) -> None:
+    """An SDK env kept across a Python upgrade still has its packages under its own version."""
+    builtin = tmp_path / "lib" / "python3.9" / "site-packages" / "pyocd" / "target"
+    (builtin / "builtin").mkdir(parents=True)
+    (builtin / "builtin" / "target_nRF54L15.py").write_text("")
+    with (
+        patch.object(framework.sys, "version_info", SimpleNamespace(major=3, minor=99)),
+        patch.object(framework, "_get_version_str", return_value="v3.4.0"),
+        patch.object(framework, "_get_python_env_path", return_value=tmp_path),
+    ):
+        assert framework.pyocd_has_builtin_target("target_nRF54L15.py")
+        assert not framework.pyocd_has_builtin_target("target_nRF54LM20A.py")

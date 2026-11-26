@@ -3,6 +3,7 @@ import esphome.codegen as cg
 from esphome.components import media_source, psram
 import esphome.config_validation as cv
 from esphome.const import (
+    CONF_BITS_PER_SAMPLE,
     CONF_BUFFER_SIZE,
     CONF_ID,
     CONF_SAMPLE_RATE,
@@ -11,7 +12,9 @@ from esphome.const import (
 from esphome.types import ConfigType
 
 from .. import (
+    CODEC_FLAC,
     CODEC_OPUS,
+    CODEC_PCM,
     CODECS,
     CONF_CODECS,
     CONF_DECODE_MEMORY,
@@ -58,6 +61,11 @@ def _resolve_codecs(config: ConfigType) -> ConfigType:
             f"Codec '{CODEC_OPUS}' requires a {CONF_SAMPLE_RATE} of {OPUS_SAMPLE_RATE}",
             path=[CONF_CODECS],
         )
+    if CODEC_FLAC not in codecs and CODEC_PCM not in codecs:
+        raise cv.Invalid(
+            f"Codecs must include '{CODEC_FLAC}' or '{CODEC_PCM}'",
+            path=[CONF_CODECS],
+        )
     return config
 
 
@@ -67,6 +75,7 @@ def _register(config: ConfigType) -> ConfigType:
         {
             CONF_CODECS: config[CONF_CODECS],
             CONF_SAMPLE_RATE: config[CONF_SAMPLE_RATE],
+            CONF_BITS_PER_SAMPLE: config[CONF_BITS_PER_SAMPLE],
             CONF_BUFFER_SIZE: config[CONF_BUFFER_SIZE],
             CONF_INITIAL_STATIC_DELAY: config[CONF_INITIAL_STATIC_DELAY],
             CONF_FIXED_DELAY: config[CONF_FIXED_DELAY],
@@ -89,7 +98,7 @@ CONFIG_SCHEMA = cv.All(
                 cv.positive_time_period_milliseconds,
                 cv.Range(max=cv.TimePeriod(milliseconds=5000)),
             ),
-            cv.Optional(CONF_STATIC_DELAY_ADJUSTABLE, default=False): cv.boolean,
+            cv.Optional(CONF_STATIC_DELAY_ADJUSTABLE, default=True): cv.boolean,
             cv.Optional(CONF_FIXED_DELAY, default="0us"): cv.All(
                 cv.positive_time_period_microseconds,
                 cv.Range(max=cv.TimePeriod(microseconds=10000)),
@@ -97,6 +106,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_SAMPLE_RATE, default=48000): cv.int_range(
                 min=16000, max=96000
             ),
+            cv.Optional(CONF_BITS_PER_SAMPLE, default=16): cv.one_of(16, 24, int=True),
             cv.Optional(CONF_DECODE_MEMORY): cv.one_of(*MEMORY_LOCATIONS, lower=True),
             cv.Optional(CONF_CODECS): cv.All(
                 cv.ensure_list(cv.enum(CODECS, lower=True)), cv.Length(min=1)

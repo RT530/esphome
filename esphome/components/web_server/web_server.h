@@ -4,7 +4,10 @@
 
 #include "esphome/components/json/json_util.h"
 #include "esphome/components/web_server_base/web_server_base.h"
-#ifdef USE_WEBSERVER
+#include "esphome/components/web_server_base/captive_dns.h"
+// The host only builds sse_chunk.cpp for unit tests, but other tests can define USE_WEBSERVER there
+#if defined(USE_WEBSERVER) && (defined(USE_ESP32) || defined(USE_ARDUINO))
+#include "event_source.h"
 #include "esphome/core/component.h"
 #include "esphome/core/entity_base.h"
 #include "esphome/core/entity_includes.h"
@@ -14,7 +17,6 @@
 #endif
 
 #include <functional>
-#include <list>
 #include <map>
 #include <string>
 #include <utility>
@@ -37,8 +39,8 @@ extern const size_t ESPHOME_WEBSERVER_JS_INCLUDE_SIZE;
 
 namespace esphome::web_server {
 
-// ESP-IDF cuts a log event here: nothing a browser log view needs is longer, and it bounds the
-// tail a stalled client keeps. The Arduino backend takes a C string and sends the whole line.
+// Every platform cuts a log event here: nothing a browser log view needs is longer, and it bounds
+// the tail a stalled client keeps.
 constexpr size_t LOG_EVENT_MAX_LEN = 512;
 
 // Parameter names live in flash on ESP8266
@@ -59,13 +61,16 @@ struct EntityMatchResult {
 
 /// Internal helper struct that is used to parse incoming URLs
 struct UrlMatch {
+  // User-provided so GCC stores the defaults instead of copying a constant, which is RAM on ESP8266
+  UrlMatch() {}      // NOLINT(modernize-use-equals-default)
   StringRef domain;  ///< Domain within URL, for example "sensor"
   StringRef id;      ///< Entity name/id within URL, for example "Temperature"
   StringRef method;  ///< Method within URL, for example "turn_on"
 #ifdef USE_DEVICES
   StringRef device_name;  ///< Device name within URL, empty for main device
 #endif
-  bool valid{false};  ///< Whether this match is valid
+  bool valid{false};             ///< Whether this match is valid
+  bool include_internal{false};  ///< Whether internal entities may match, the web server's include_internal
 
   // Helper methods for string comparisons
   bool domain_equals(const char *str) const { return this->domain == str; }
@@ -77,7 +82,7 @@ struct UrlMatch {
   bool method_equals(const __FlashStringHelper *str) const { return this->method == str; }
 #endif
 
-  /// Match entity by name
+  /// Match entity by name; internal entities match only if include_internal is set
   /// Returns EntityMatchResult with match status and whether action segment is empty
   EntityMatchResult match_entity(EntityBase *entity) const;
 };
@@ -96,92 +101,6 @@ struct SortingGroup {
 
 enum JsonDetail { DETAIL_ALL, DETAIL_STATE };
 
-/*
-  In order to defer updates in arduino mode, we need to create one AsyncEventSource per incoming request to /events.
-  This is because only minimal changes were made to the ESPAsyncWebServer lib_dep, it was undesirable to put deferred
-  update logic into that library. We need one deferred queue per connection so instead of one AsyncEventSource with
-  multiple clients, we have multiple event sources with one client each. This is slightly awkward which is why it's
-  implemented in a more straightforward way for ESP-IDF. Arduino platform will eventually go away and this workaround
-  can be forgotten.
-*/
-#if !defined(USE_ESP32) && defined(USE_ARDUINO)
-using message_generator_t = void(WebServer *, void *, json::JsonBuilder &);
-
-class DeferredUpdateEventSourceList;
-class DeferredUpdateEventSource final : public AsyncEventSource {
-  friend class DeferredUpdateEventSourceList;
-
-  /*
-    This class holds a pointer to the source component that wants to publish a state event, and a pointer to a function
-    that will lazily generate that event.  The two pointers allow dedup in the deferred queue if multiple publishes for
-    the same component are backed up, and take up only two pointers of memory.  The entry in the deferred queue (a
-    std::vector) is the DeferredEvent instance itself (not a pointer to one elsewhere in heap) so still only two
-    pointers per entry (and no heap fragmentation).  Even 100 backed up events (you'd have to have at least 100 sensors
-    publishing because of dedup) would take up only 0.8 kB.
-  */
-  struct DeferredEvent {
-    friend class DeferredUpdateEventSource;
-
-   protected:
-    void *source_;
-    message_generator_t *message_generator_;
-
-   public:
-    DeferredEvent(void *source, message_generator_t *message_generator)
-        : source_(source), message_generator_(message_generator) {}
-    bool operator==(const DeferredEvent &test) const {
-      return (source_ == test.source_ && message_generator_ == test.message_generator_);
-    }
-  };
-  static_assert(sizeof(DeferredEvent) == sizeof(void *) + sizeof(message_generator_t *),
-                "DeferredEvent should have no padding");
-
- protected:
-  // surface a couple methods from the base class
-  using AsyncEventSource::handleRequest;
-  using AsyncEventSource::send;
-
-  ListEntitiesIterator entities_iterator_;
-  // vector is used very specifically for its zero memory overhead even though items are popped from the front (memory
-  // footprint is more important than speed here)
-  std::vector<DeferredEvent> deferred_queue_;
-  WebServer *web_server_;
-  uint16_t consecutive_send_failures_{0};
-  static constexpr uint16_t MAX_CONSECUTIVE_SEND_FAILURES = 2500;  // ~20 seconds at 125Hz loop rate
-
-  // helper for allowing only unique entries in the queue
-  void deq_push_back_with_dedup_(void *source, message_generator_t *message_generator);
-
-  void process_deferred_queue_();
-
- public:
-  DeferredUpdateEventSource(WebServer *ws, const String &url)
-      : AsyncEventSource(url), entities_iterator_(ListEntitiesIterator(ws, this)), web_server_(ws) {}
-
-  void loop();
-
-  void deferrable_send_state(void *source, const char *event_type, message_generator_t *message_generator);
-  void try_send_nodefer(const char *message, size_t message_len, const char *event = nullptr, uint32_t id = 0,
-                        uint32_t reconnect = 0);
-};
-
-class DeferredUpdateEventSourceList final : public std::list<DeferredUpdateEventSource *> {
- protected:
-  void on_client_connect_(DeferredUpdateEventSource *source);
-  void on_client_disconnect_(DeferredUpdateEventSource *source);
-
- public:
-  /// Returns true if there are event sources remaining (including pending cleanup).
-  bool loop();
-
-  void deferrable_send_state(void *source, const char *event_type, message_generator_t *message_generator);
-  void try_send_nodefer(const char *message, size_t message_len, const char *event = nullptr, uint32_t id = 0,
-                        uint32_t reconnect = 0);
-
-  void add_new_client(WebServer *ws, AsyncWebServerRequest *request);
-};
-#endif
-
 /** This class allows users to create a web server with their ESP nodes.
  *
  * Behind the scenes it's using AsyncWebServer to set up the server. It exposes 3 things:
@@ -192,10 +111,6 @@ class DeferredUpdateEventSourceList final : public std::list<DeferredUpdateEvent
  * can be found under https://esphome.io/web-api/.
  */
 class WebServer final : public Component, public AsyncWebHandler {
-#if !defined(USE_ESP32) && defined(USE_ARDUINO)
-  friend class DeferredUpdateEventSourceList;
-#endif
-
  public:
   WebServer(web_server_base::WebServerBase *base);
 
@@ -243,22 +158,6 @@ class WebServer final : public Component, public AsyncWebHandler {
    */
   void set_expose_log(bool expose_log) { this->expose_log_ = expose_log; }
 
-#ifdef USE_WEBSERVER_ALLOWED_ORIGINS
-  /** Set the origins that browsers are allowed to make cross-origin requests from.
-   *
-   * Requests without an `Origin` header (e.g. non-browser clients like curl or the native API)
-   * are always allowed. Requests whose `Origin` matches the address the device is served on
-   * (same-origin) are always allowed. Any other browser origin must appear in this list, or the
-   * request is rejected. A single "*" entry allows any origin. Each other entry must exactly match
-   * the requesting page's `Origin` header (e.g. "https://example.com").
-   *
-   * This list is also used to authorize Private Network Access requests when that feature is enabled.
-   *
-   * @param origins The list of allowed origins.
-   */
-  void set_allowed_origins(std::initializer_list<const char *> origins) { this->allowed_origins_ = origins; }
-#endif
-
   // ========== INTERNAL METHODS ==========
   // (In most use cases you won't need these)
   /// Setup the internal web server and register handlers.
@@ -276,6 +175,14 @@ class WebServer final : public Component, public AsyncWebHandler {
 
   /// Handle an index request under '/'.
   void handle_index_request(AsyncWebServerRequest *request);
+
+#ifdef USE_WEBSERVER_CAPTIVE
+  /// AP mode: DNS answers every name with the AP address and unknown URLs redirect to the interface.
+  /// wifi calls start before setup(), so it may touch nothing but dns_ (enable_loop is a no-op then).
+  void start_captive();
+  void end_captive();
+  bool is_captive() const { return this->dns_.is_running(); }
+#endif
 
   /// Return the webserver configuration as JSON.
   json::SerializationBuffer<> get_config_json();
@@ -524,13 +431,23 @@ class WebServer final : public Component, public AsyncWebHandler {
   void add_entity_config(EntityBase *entity, float weight, uint64_t group);
   void add_sorting_group(uint64_t group_id, const std::string &group_name, float weight);
 
-  std::map<EntityBase *, SortingComponents> sorting_entitys_;
+  std::map<EntityBase *, SortingComponents> sorting_entities_;
   std::map<uint64_t, SortingGroup> sorting_groups_;
 #endif
 
   bool include_internal_{false};
 
  protected:
+  // Declared here so it packs into the padding after include_internal_
+  bool expose_log_{true};
+
+  // Out of line so the per-domain update callbacks stay small
+  // source stays the concrete entity pointer, since the generators cast it back to that type
+  template<typename T> void send_state_event_(T *obj, message_generator_t *generator) {
+    this->send_state_event_(obj, static_cast<const EntityBase *>(obj), generator);
+  }
+  void send_state_event_(void *source, const EntityBase *entity, message_generator_t *generator);
+
   void add_sorting_info_(JsonObject &root, EntityBase *entity);
 
 #ifdef USE_LIGHT
@@ -598,10 +515,10 @@ class WebServer final : public Component, public AsyncWebHandler {
   }
 
   web_server_base::WebServerBase *base_;
-#ifdef USE_ESP32
-  AsyncEventSource events_{StringRef::from_lit("/events"), this};
-#elif USE_ARDUINO
-  DeferredUpdateEventSourceList events_;
+  AsyncEventSource events_;
+#ifdef USE_WEBSERVER_CAPTIVE
+  void handle_not_found_(AsyncWebServerRequest *request);
+  web_server_base::CaptiveDNS dns_;
 #endif
 
 #if USE_WEBSERVER_VERSION == 1
@@ -614,17 +531,6 @@ class WebServer final : public Component, public AsyncWebHandler {
 #ifdef USE_WEBSERVER_JS_INCLUDE
   const char *js_include_{nullptr};
 #endif
-  bool expose_log_{true};
-#ifdef USE_WEBSERVER_ALLOWED_ORIGINS
-  // Extra origins allowed to make cross-origin browser requests ("*" means any origin).
-  // Only compiled when allowed_origins is configured; same-origin is always allowed regardless.
-  FixedVector<const char *> allowed_origins_;
-#endif
-
-  /// Check whether the given request Origin is permitted. Same-origin (matching the Host the
-  /// request was sent to) and requests without an Origin header are always allowed; any other
-  /// origin must be listed in allowed_origins. The caller passes the already-read Origin header.
-  bool is_request_origin_allowed_(AsyncWebServerRequest *request, const std::string &origin);
 
  private:
 #ifdef USE_SENSOR
@@ -654,7 +560,7 @@ class WebServer final : public Component, public AsyncWebHandler {
   void cover_json_(cover::Cover *obj, JsonDetail start_config, json::JsonBuilder &builder);
 #endif
 #ifdef USE_NUMBER
-  void number_json_(number::Number *obj, float value, JsonDetail start_config, json::JsonBuilder &builder);
+  void number_json_(number::Number *obj, JsonDetail start_config, json::JsonBuilder &builder);
 #endif
 #ifdef USE_DATETIME_DATE
   void date_json_(datetime::DateEntity *obj, JsonDetail start_config, json::JsonBuilder &builder);
@@ -701,6 +607,10 @@ class WebServer final : public Component, public AsyncWebHandler {
   void update_json_(update::UpdateEntity *obj, JsonDetail start_config, json::JsonBuilder &builder);
 #endif
 };
+
+#ifdef USE_WEBSERVER_CAPTIVE
+extern WebServer *global_web_server;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+#endif
 
 }  // namespace esphome::web_server
 #endif

@@ -7,7 +7,8 @@ empty statement -- and a -Wempty-body warning -- once the log level compiles the
 tests pin the comment/string/raw-string masker, the accepted control-statement shapes, and the
 NOLINT escape hatch at both placements a contributor would try.
 
-Also covers the ESP_LOG call scanner (_iter_log_calls) and the bare-literal-ternary lint.
+Also covers the log call scanner (_iter_log_calls), the bare-literal-ternary lint and the
+direct esp_log_printf_ format lint.
 """
 
 import importlib.util
@@ -380,9 +381,340 @@ def test_ternary_literal_detection(
     assert _ternary_errors(content) == expected
 
 
+def test_iter_log_calls_includes_direct_calls() -> None:
+    content = 'esp_log_printf_(level, TAG, __LINE__, ESPHOME_LOG_FORMAT("%s"), x)'
+    assert _calls(content + ";\nint other = (1);") == [content]
+    # Only the call is scanned, never a name that merely ends in esp_log_printf_
+    assert _calls('my_esp_log_printf_(level, "x");') == []
+    # Nor a call that is commented out or inside a string
+    assert _calls('// ESP_LOGD(TAG, "x");\nconst char *s = "ESP_LOGD(TAG, x)";') == []
+
+
+def test_ternary_literal_in_direct_call() -> None:
+    content = (
+        'esp_log_printf_(level, TAG, __LINE__, ESPHOME_LOG_FORMAT("%s"), '
+        'x ? "on" : "off");'
+    )
+    assert _ternary_errors(content) == [(1, 69), (1, 76)]
+
+
+def _format_errors(content: str) -> list[tuple[int, int]]:
+    errs = ci_custom.lint_log_direct_call_format_in_flash(Path("x.cpp"), content)
+    return [(line, col) for line, col, _ in errs]
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ('esp_log_printf_(level, TAG, __LINE__, "a %d", x);', [(1, 39)]),
+        (
+            'esp_log_printf_(level, TAG, __LINE__,\n                "a %d", x);',
+            [(2, 17)],
+        ),
+        # Commas and literals inside earlier arguments do not shift the format
+        ('esp_log_printf_(pick(a, b), "tag", f(1, 2), "a %d", x);', [(1, 45)]),
+        ('esp_log_printf_(level, TAG, __LINE__, ESPHOME_LOG_FORMAT("a %d"), x);', []),
+        ("esp_log_printf_(level, TAG, line, format, param);", []),
+        (
+            "void esp_log_printf_(int level, const char *tag, int line, const char *format, ...);",
+            [],
+        ),
+        ('esp_log_printf_(level, TAG, __LINE__, "a %d", x);  // NOLINT', []),
+        ('ESP_LOGD(TAG, "a %d", x);', []),
+        # The form the log macros expand to
+        ('::esphome::esp_log_printf_(l, TAG, 1, "x");', [(1, 39)]),
+        ("esp_log_printf_(level, TAG, __LINE__);", []),
+        # Lambda captures and braced initializers in earlier arguments do not shift the format
+        (
+            'esp_log_printf_(level, [a, b]() { return TAG; }(), Pos{1, 2}.line, "x");',
+            [(1, 68)],
+        ),
+        # Template argument lists in earlier arguments; a spaced `<` is a comparison
+        (
+            'esp_log_printf_(level, TAG, std::integral_constant<int, 42>::value, "x");',
+            [(1, 69)],
+        ),
+        ('esp_log_printf_(a < b ? 1 : 2, TAG, n > 0, "x");', [(1, 44)]),
+        ('esp_log_printf_(p->level, TAG, x >= 2, "x");', [(1, 40)]),
+        # A `>` inside parentheses does not close a template opened outside them
+        ('esp_log_printf_(level, TAG, pick<(N > 0), 42>(), "x");', [(1, 50)]),
+        # A templated lambda's parameter list holds commas too
+        (
+            'esp_log_printf_([]<typename A, typename B>(A a) { return a; }(1), TAG, __LINE__, "x");',
+            [(1, 82)],
+        ),
+        # An unspaced comparison never closes, so the split falls back to plain commas
+        ('esp_log_printf_(level, TAG, i<n ? 1 : 2, "x");', [(1, 42)]),
+        # A line continuation inside a multi-line macro before the format
+        (
+            '#define LOG_X(l) esp_log_printf_(l, TAG, __LINE__, \\\n    "x")',
+            [(2, 5)],
+        ),
+        # A comment before the format, raw and prefixed literals
+        ('esp_log_printf_(level, TAG, __LINE__, /* fmt */ "x");', [(1, 49)]),
+        ('esp_log_printf_(level, TAG, __LINE__, R"(x)");', [(1, 39)]),
+        # Commented-out calls and calls inside strings are not code
+        ('// esp_log_printf_(level, TAG, __LINE__, "x");', []),
+        ('/* esp_log_printf_(level, TAG, __LINE__, "x"); */', []),
+        ('const char *doc = "esp_log_printf_(level, TAG, __LINE__, \\"x\\");";', []),
+    ],
+)
+def test_direct_call_format_detection(
+    content: str, expected: list[tuple[int, int]]
+) -> None:
+    assert _format_errors(content) == expected
+
+
+def test_direct_call_format_error_message() -> None:
+    errs = ci_custom.lint_log_direct_call_format_in_flash(
+        Path("x.cpp"), 'esp_log_printf_(level, TAG, __LINE__, "a %d", x);'
+    )
+    assert len(errs) == 1
+    assert 'ESPHOME_LOG_FORMAT("a %d")' in errs[0][2]
+
+
 def test_ternary_error_message_names_the_literal() -> None:
     errs = ci_custom.lint_log_no_bare_literal_ternary(
         Path("x.cpp"), 'ESP_LOGD(TAG, "%s", x ? "enabled" : LOG_STR_LITERAL("off"));'
     )
     assert len(errs) == 1
     assert 'LOG_STR_LITERAL("enabled")' in errs[0][2]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'static const char *const TAG = "x";',
+        'static const char* const TAG = "x";',
+        'static const char *TAG = "x";',
+        'constexpr const char *TAG = "x";',
+        'static const char *const TAG{"x"};',
+        'static constexpr char TAG[] = "x";',
+        'static constexpr char TAG[] = {"x"};',
+        'static const char TAG[8] = "x";',
+        '  static const char *const TAG = "x";',
+        'constexpr static const char *const TAG = "x";',
+        'const char *const Constants::TAG = "x";',
+        'const char Constants::TAG[] = "x";',
+    ],
+)
+def test_log_tag_macro_flags_plain_tags(line: str) -> None:
+    assert ci_custom.lint_log_tag_macro("test.cpp", line + "\n")
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'ESPHOME_LOG_TAG(TAG, "x");',
+        'static const char *const NAME = "x";',
+        'static const char *const TAG = "x";  // NOLINT',
+        'const char Constants::TAG[] PROGMEM = "x";',
+    ],
+)
+def test_log_tag_macro_ignores_macro_and_other_names(line: str) -> None:
+    assert not ci_custom.lint_log_tag_macro("test.cpp", line + "\n")
+
+
+@pytest.mark.parametrize(
+    ("fname", "covered"),
+    [
+        ("esphome/components/x/x.cpp", True),
+        ("esphome/components/x/x.h", True),
+        ("esphome/components/x/sub/x.h", True),
+        ("esphome/core/wake/wake_host.cpp", True),
+        ("esphome/components/x/x.c", False),
+    ],
+)
+def test_log_tag_lints_cover_headers_and_core(fname: str, covered: bool) -> None:
+    for name, line in (
+        ("lint_log_tag_macro", 'static const char *const TAG = "x";\n'),
+        ("lint_log_tag_as_string", "strcmp(TAG, name);\n"),
+    ):
+        lint = next(
+            c for c in ci_custom.LINT_CONTENT_CHECKS if c["func"].__name__ == name
+        )
+        assert bool(ci_custom.run_check(lint, fname, fname, line)) is covered
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "this->set_timeout(TAG, 100, cb);",
+        "strcmp(TAG, name);",
+        "strcmp(name, TAG);",
+        "strncpy(buf, TAG, sizeof(buf));",
+        "strcmp(get_name(), TAG);",
+        "this->set_timeout(make_id(x), TAG, cb);",
+        "std::string(TAG);",
+        "std::string name = TAG;",
+        "std::string name{TAG};",
+        "strlen(Constants::TAG);",
+        "this->set_timeout(Constants::TAG, 100, cb);",
+    ],
+)
+def test_log_tag_as_string_flags_string_uses(line: str) -> None:
+    assert ci_custom.lint_log_tag_as_string("test.cpp", line + "\n")
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'ESP_LOGD(TAG, "x");',
+        'this->set_timeout(100, [this]() { ESP_LOGD(TAG, "x"); });',
+        "strcmp(name, OTHER_TAG);",
+    ],
+)
+def test_log_tag_as_string_ignores_logging(line: str) -> None:
+    assert not ci_custom.lint_log_tag_as_string("test.cpp", line + "\n")
+
+
+@pytest.mark.parametrize(
+    ("content", "flagged"),
+    [
+        ("auto s = format_hex_pretty(data, len);\n", True),
+        # Explicit template arguments must not hide the call
+        ("auto s = format_hex_pretty<uint32_t>(v, '\\0', false);\n", True),
+        ("auto s = format_hex<std::array<uint8_t, 4>>(arr);\n", True),
+        (
+            "auto s = format_hex<std::conditional_t<true, std::make_unsigned_t<int>, uint64_t>>(v);\n",
+            True,
+        ),
+        ("auto s = format_hex < 3;\n", False),
+        ("format_hex_pretty_to(buf, sizeof(buf), data, len);\n", False),
+    ],
+)
+def test_heap_allocating_helpers_detection(content: str, flagged: bool) -> None:
+    errs = ci_custom.lint_no_heap_allocating_helpers(
+        Path("esphome/components/x/x.cpp"), content
+    )
+    assert bool(errs) is flagged
+
+
+# --- rule: every component __init__.py defines DOMAIN as its own name ---
+
+
+def _domain_check() -> dict:
+    return next(
+        c
+        for c in ci_custom.LINT_CONTENT_CHECKS
+        if c["func"] is ci_custom.lint_component_domain
+    )
+
+
+def _lint_domain(fname: str, content: str) -> str | None:
+    return ci_custom.run_check(_domain_check(), fname, Path(fname), content)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'CODEOWNERS = ["@x"]\nDOMAIN = "uart"\n',
+        'DOMAIN: str = "uart"\n',
+    ],
+)
+def test_domain_matching_component_name_passes(content: str) -> None:
+    assert _lint_domain("esphome/components/uart/__init__.py", content) is None
+
+
+def test_domain_leaves_syntax_errors_to_the_python_linters() -> None:
+    assert _lint_domain("esphome/components/uart/__init__.py", "def (\n") is None
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'CODEOWNERS = ["@x"]\n',
+        'DOMAIN = "spi"\n',
+        "DOMAIN = CONF_UART\n",
+        '"""Docstring.\n\nDOMAIN = "uart"\n"""\n',
+        'def f() -> None:\n    DOMAIN = "uart"\n',
+        'OTHER = "uart"\n',
+        "DOMAIN: str\n",
+    ],
+)
+def test_domain_missing_or_wrong_is_flagged(content: str) -> None:
+    err = _lint_domain("esphome/components/uart/__init__.py", content)
+    assert err is not None
+    assert 'DOMAIN = "uart"' in err
+
+
+@pytest.mark.parametrize(
+    "fname",
+    [
+        "esphome/components/uart/sensor/__init__.py",
+        "esphome/components/uart/sensor.py",
+        "esphome/core/__init__.py",
+    ],
+)
+def test_domain_ignores_files_other_than_component_init(fname: str) -> None:
+    assert _lint_domain(fname, "") is None
+
+
+def test_every_component_defines_its_domain() -> None:
+    components = SCRIPT_DIR.parent / "esphome" / "components"
+    missing = [
+        init.parent.name
+        for init in sorted(components.glob("*/__init__.py"))
+        if ci_custom.lint_component_domain(
+            init.relative_to(SCRIPT_DIR.parent), init.read_text(encoding="utf-8")
+        )
+    ]
+    assert missing == []
+
+
+GY39_NO_ID = "sensor:\n  - platform: gy39\n    illuminance:\n      name: Lux\n"
+
+
+@pytest.mark.parametrize(
+    ("content", "id_key"),
+    [
+        pytest.param(GY39_NO_ID, "i2c_id", id="i2c"),
+        pytest.param(
+            "sensor:\n  - platform: motion\n    type: acceleration_x\n",
+            "motion_id",
+            id="motion",
+        ),
+        pytest.param(
+            "sensor:\n  - platform: dallas_temp\n    address: 0x1C\n",
+            "one_wire_id",
+            id="one-wire",
+        ),
+        pytest.param(
+            "sensor:\n  - platform: gy39\n    i2c_id:\n",
+            "i2c_id",
+            id="empty-id",
+        ),
+    ],
+)
+def test_grouped_test_ids_flags_omitted_id(content: str, id_key: str) -> None:
+    errs = ci_custom.lint_grouped_test_ids("tests/components/gy39/common.yaml", content)
+    assert [(line, col) for line, col, _ in errs] == [(2, 5)]
+    assert id_key in errs[0][2]
+
+
+@pytest.mark.parametrize(
+    ("fname", "content"),
+    [
+        pytest.param(
+            "tests/components/gy39/common.yaml",
+            "sensor:\n  - platform: gy39\n    i2c_id: i2c_bus\n    illuminance:\n      name: Lux\n",
+            id="named-bus",
+        ),
+        pytest.param("tests/components/lvgl/common.yaml", GY39_NO_ID, id="isolated"),
+        pytest.param(
+            "tests/components/gy39/common.yaml",
+            "sensor:\n  - platform: uptime\n    name: Up\n",
+            id="not-i2c",
+        ),
+    ],
+)
+def test_grouped_test_ids_accepts(fname: str, content: str) -> None:
+    assert not ci_custom.lint_grouped_test_ids(fname, content)
+
+
+def test_grouped_test_ids_flags_empty_hub_declaration() -> None:
+    errs = ci_custom.lint_grouped_test_ids(
+        "tests/components/gy39/common.yaml", "as5600:\n"
+    )
+    assert [(line, col) for line, col, _ in errs] == [(1, 8)]
+    assert "i2c_id" in errs[0][2]

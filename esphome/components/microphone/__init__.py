@@ -21,6 +21,7 @@ from esphome.types import ConfigType
 
 AUTO_LOAD = ["audio"]
 CODEOWNERS = ["@jesserockz", "@kahrendt"]
+DOMAIN = "microphone"
 
 IS_PLATFORM_COMPONENT = True
 
@@ -28,10 +29,11 @@ microphone_ns = cg.esphome_ns.namespace("microphone")
 
 Microphone = microphone_ns.class_("Microphone")
 MicrophoneSource = microphone_ns.class_("MicrophoneSource")
-
 DataTrigger = microphone_ns.class_(
     "DataTrigger",
-    automation.Trigger.template(cg.std_vector.template(cg.uint8).operator("ref")),
+    automation.Trigger.template(
+        cg.std_vector.template(cg.uint8).operator("ref").operator("const")
+    ),
 )
 
 
@@ -54,9 +56,7 @@ async def register_microphone(var: MockObj, config: ConfigType) -> None:
 MICROPHONE_SCHEMA = cv.Schema.extend(audio.AUDIO_COMPONENT_SCHEMA).extend(
     {
         cv.Optional(CONF_ON_DATA): automation.validate_automation(
-            {
-                cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(DataTrigger),
-            }
+            {cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(DataTrigger)}
         ),
     }
 )
@@ -121,7 +121,7 @@ def final_validate_microphone_source_schema(
         sample_rate (int, optional): The sample rate the component requesting mic audio requires
     """
 
-    def _validate_audio_compatability(config: ConfigType) -> ConfigType:
+    def _validate_audio_compatibility(config: ConfigType) -> ConfigType:
         if sample_rate is not cv.UNDEFINED:
             # Issues require changing the microphone configuration
             #  - Verifies sample rates match
@@ -143,7 +143,7 @@ def final_validate_microphone_source_schema(
 
         return config
 
-    return _validate_audio_compatability
+    return _validate_audio_compatibility
 
 
 async def microphone_source_to_code(

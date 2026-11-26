@@ -7,7 +7,7 @@
 
 namespace esphome::remote_base {
 
-static const char *const TAG = "remote.hob2hood";
+ESPHOME_LOG_TAG(TAG, "remote.hob2hood");
 
 // A frame is 25 bits: a leading 0, then the command byte, command + 1 and command + 2. Zero bits are marks
 // and one bits are spaces; equal neighbours merge into one run of n * BIT_TIME_US plus a fixed adjustment.
@@ -76,8 +76,7 @@ void Hob2HoodProtocol::dump(const Hob2HoodData &data) {
   uint8_t index = 0;
   while (index < COMMANDS.size() && COMMANDS[index] != data.command)
     index++;
-  ESP_LOGI(TAG, "Received Hob2Hood: %s",
-           LOG_STR_ARG(Hob2HoodCommandNames::get_log_str(index, Hob2HoodCommandNames::LAST_INDEX)));
+  ESP_LOGI(TAG, "Received Hob2Hood: %s", LOG_STR_ARG(Hob2HoodCommandNames::get_log_str(index)));
 }
 
 }  // namespace esphome::remote_base

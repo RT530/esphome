@@ -11,11 +11,14 @@ binary_sensor:
   - platform: template
     name: "Garage Door Open 12"
     report: "force"
-    endpoint: 1
+    endpoint: 11
   - platform: template
     name: "Garage Door Open 13"
     endpoint: 2
     use_device_type: false
+    on_press:
+      then:
+        - zigbee.report
 
 sensor:
   - platform: template
@@ -23,9 +26,10 @@ sensor:
     lambda: return 10.0;
     device_class: temperature
     unit_of_measurement: "°C"
-    endpoint: 1
+    endpoint: 11
     use_device_type: true
     cluster: device_class
+    report: enable
   - platform: template
     name: "Light Sensor"
     lambda: return 100.0;
@@ -44,6 +48,14 @@ sensor:
     unit_of_measurement: L/h
     device_class: volume_flow_rate
     cluster: device_class
+  - platform: template
+    name: "battery"
+    device_class: battery
+    cluster: power_config
+  - platform: template
+    name: "battery voltage"
+    device_class: voltage
+    cluster: power_config
 
 switch:
   - platform: template
@@ -58,8 +70,11 @@ switch:
 
 zigbee:
   model: zigbee_test
-  router: false
-  power_source: MAINS_SINGLE_PHASE
+  manufacturer: test
+  version: 1
+  sleepy: true
+  polling_interval: 2s
+  power_source: BATTERY
   on_join:
     then:
       - logger.log: "Joined network"

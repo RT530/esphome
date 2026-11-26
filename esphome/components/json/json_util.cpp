@@ -7,7 +7,7 @@
 
 namespace esphome::json {
 
-static const char *const TAG = "json";
+ESPHOME_LOG_TAG(TAG, "json");
 
 #ifdef USE_PSRAM
 // Global allocator that outlives all JsonDocuments returned by parse_json()
@@ -16,7 +16,7 @@ static const char *const TAG = "json";
 static SpiRamAllocator global_json_allocator;
 #endif
 
-SerializationBuffer<> build_json(const json_build_t &f) {
+SerializationBuffer<> build_json(JsonBuildRef f) {
   // NOLINTBEGIN(clang-analyzer-cplusplus.NewDeleteLeaks) false positive with ArduinoJson
   JsonBuilder builder;
   JsonObject root = builder.root();

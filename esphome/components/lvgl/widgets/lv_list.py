@@ -20,6 +20,7 @@ from esphome.schema_extractors import SCHEMA_EXTRACT, schema_extractor
 from ..automation import action_to_code
 from ..defines import (
     CONF_ALIGN_TO,
+    CONF_CLICKABLE,
     CONF_MAIN,
     CONF_PAD_ROW,
     CONF_SCROLLBAR,
@@ -51,7 +52,7 @@ from ..schemas import (
     remap_property,
 )
 from ..trigger import add_trigger
-from ..types import LV_EVENT, LvType, ObjUpdateAction, lv_obj_t
+from ..types import LV_EVENT, LvType, lv_obj_t
 from . import (
     Widget,
     WidgetType,
@@ -188,7 +189,7 @@ LIST_ID_SCHEMA = cv.Schema({cv.Required(CONF_ID): cv.use_id(lv_list_t)})
 
 @automation.register_action(
     "lvgl.list.add_text",
-    ObjUpdateAction,
+    automation.ApplyAction,
     LIST_ID_SCHEMA.extend(
         {
             cv.Required(CONF_TEXT): lv_text,
@@ -242,7 +243,7 @@ _UNSUPPORTED_DYNAMIC_KEYS = SWIPE_TRIGGERS + (CONF_ON_BOOT, CONF_ALIGN_TO)
 
 
 def _check_no_unsupported_triggers(w_type_name: str, w_conf: dict) -> None:
-    # These triggers currently aren't supporte for dynamic widgets
+    # These triggers currently aren't supported for dynamic widgets
     for key in _UNSUPPORTED_DYNAMIC_KEYS:
         if key in w_conf:
             raise cv.Invalid(
@@ -335,7 +336,7 @@ def _register_dynamic_widget_style_uses(w_conf: dict) -> None:
 
 @automation.register_action(
     "lvgl.list.add",
-    ObjUpdateAction,
+    automation.ApplyAction,
     list_add_schema,
     synchronous=True,
 )
@@ -441,7 +442,7 @@ async def _wire_dynamic_triggers(w: Widget, config: dict) -> None:
     for event, conf in {
         event: conf for event, conf in config.items() if event in LV_EVENT_TRIGGERS
     }.items():
-        w.add_flag("LV_OBJ_FLAG_CLICKABLE")
+        w.set_flag(CONF_CLICKABLE, True)
         await add_trigger(
             conf[0], event_target, event, attach_obj=w.obj, user_data=user_data
         )
@@ -472,7 +473,7 @@ LIST_REMOVE_SCHEMA = LIST_ID_SCHEMA.extend(
 
 @automation.register_action(
     "lvgl.list.remove",
-    ObjUpdateAction,
+    automation.ApplyAction,
     LIST_REMOVE_SCHEMA,
     synchronous=True,
 )
@@ -503,7 +504,7 @@ async def list_remove_to_code(config, action_id, template_arg, args):
 
 @automation.register_action(
     "lvgl.list.clear",
-    ObjUpdateAction,
+    automation.ApplyAction,
     LIST_ID_SCHEMA,
     synchronous=True,
 )

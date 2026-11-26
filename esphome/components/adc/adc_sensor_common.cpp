@@ -3,19 +3,7 @@
 
 namespace esphome::adc {
 
-static const char *const TAG = "adc";
-
-const LogString *sampling_mode_to_str(SamplingMode mode) {
-  switch (mode) {
-    case SamplingMode::AVG:
-      return LOG_STR("average");
-    case SamplingMode::MIN:
-      return LOG_STR("minimum");
-    case SamplingMode::MAX:
-      return LOG_STR("maximum");
-  }
-  return LOG_STR("unknown");
-}
+ESPHOME_LOG_TAG(TAG, "adc");
 
 template<typename T> Aggregator<T>::Aggregator(SamplingMode mode) {
   this->mode_ = mode;
@@ -66,7 +54,7 @@ template class Aggregator<uint32_t>;
 
 void ADCSensor::update() {
   float value_v = this->sample();
-  ESP_LOGV(TAG, "'%s': Voltage=%.4fV", this->get_name().c_str(), value_v);
+  ESP_LOGV(TAG, "'%s': Voltage=%.4fV", LOG_STR_ARG(this->get_log_name()), value_v);
   this->publish_state(value_v);
 }
 

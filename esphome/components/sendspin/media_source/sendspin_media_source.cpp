@@ -1,6 +1,6 @@
 #include "sendspin_media_source.h"
 
-#if defined(USE_ESP32) && defined(USE_SENDSPIN_CONTROLLER) && defined(USE_SENDSPIN_PLAYER)
+#if defined(USE_ESP_IDF) && defined(USE_SENDSPIN_CONTROLLER) && defined(USE_SENDSPIN_PLAYER)
 
 #include "esphome/components/audio/audio.h"
 #include "esphome/core/log.h"
@@ -9,7 +9,7 @@
 
 namespace esphome::sendspin_ {
 
-static const char *const TAG = "sendspin.media_source";
+ESPHOME_LOG_TAG(TAG, "sendspin.media_source");
 
 static constexpr char URI_PREFIX[] = "sendspin://";
 
@@ -24,7 +24,7 @@ void SendspinMediaSource::setup() {
   // Push cached states to player role. They may have been set before setup() ran.
   this->player_role_->update_volume(std::roundf(this->cached_volume_ * 100.0f));
   this->player_role_->update_muted(this->cached_muted_);
-  this->player_role_->set_static_delay_adjustable(this->static_delay_adjustable_);
+  this->player_role_->set_output_delay_adjustable(this->static_delay_adjustable_);
 }
 
 void SendspinMediaSource::dump_config() {
@@ -35,7 +35,7 @@ void SendspinMediaSource::dump_config() {
 void SendspinMediaSource::set_static_delay_adjustable(bool adjustable) {
   this->static_delay_adjustable_ = adjustable;
   if (this->player_role_) {
-    this->player_role_->set_static_delay_adjustable(adjustable);
+    this->player_role_->set_output_delay_adjustable(adjustable);
   }
 }
 
@@ -102,8 +102,8 @@ void SendspinMediaSource::handle_command(media_source::MediaSourceCommand comman
       if (!this->pending_start_) {
         // Ignore stop commands if we have a pending start, since the orchestrator may send a stop command before
         // play_uri
-        ESP_LOGD(TAG, "Received STOP command, updating Sendspin state to EXTERNAL_SOURCE");
-        this->parent_->update_state(sendspin::SendspinClientState::EXTERNAL_SOURCE);
+        ESP_LOGD(TAG, "Received STOP command, leaving the Sendspin group");
+        this->parent_->leave_group();
       }
       break;
     }
@@ -166,27 +166,24 @@ void SendspinMediaSource::notify_audio_played(uint32_t frames, int64_t timestamp
 // --- Sendspin PlayerRoleListener overrides ---
 
 // THREAD CONTEXT: Sendspin sync task background thread. May block up to timeout_ms.
-size_t SendspinMediaSource::on_audio_write(uint8_t *data, size_t length, uint32_t timeout_ms) {
+size_t SendspinMediaSource::on_audio_output(std::span<const uint8_t> pcm, const sendspin::AudioFormat &format,
+                                            uint32_t timeout_ms) {
   if (!this->has_listener() || (this->get_state() != media_source::MediaSourceState::PLAYING)) {
     vTaskDelay(pdMS_TO_TICKS(timeout_ms));
     return 0;
   }
 
-  // PlayerRole::get_current_stream_params() is safe to call from the sync task.
-  auto &params = this->player_role_->get_current_stream_params();
-  if (!params.bit_depth.has_value() || !params.channels.has_value() || !params.sample_rate.has_value()) {
-    vTaskDelay(pdMS_TO_TICKS(timeout_ms));
-    return 0;
-  }
-  audio::AudioStreamInfo stream_info(*params.bit_depth, *params.channels, *params.sample_rate);
+  audio::AudioStreamInfo stream_info(format.bits_per_sample, format.channels, format.sample_rate);
 
-  return this->write_output(data, length, timeout_ms, stream_info);
+  return this->write_output(pcm.data(), pcm.size(), timeout_ms, stream_info);
 }
 
 // THREAD CONTEXT: Main loop (PlayerRoleListener lifecycle callback)
 void SendspinMediaSource::on_stream_start() {
-  this->parent_->update_state(sendspin::SendspinClientState::SYNCHRONIZED);
-
+  // A stream/start for a stream already playing only changes its format, which each audio write carries
+  if (this->get_state() != media_source::MediaSourceState::IDLE) {
+    return;
+  }
   if (!this->pending_start_) {
     // Dedup rapid on_stream_start() calls
     this->pending_start_ = true;
@@ -211,4 +208,4 @@ void SendspinMediaSource::on_mute_changed(bool muted) { this->request_mute_(mute
 
 }  // namespace esphome::sendspin_
 
-#endif  // USE_ESP32 && USE_SENDSPIN_PLAYER && USE_SENDSPIN_CONTROLLER
+#endif  // USE_ESP_IDF && USE_SENDSPIN_PLAYER && USE_SENDSPIN_CONTROLLER

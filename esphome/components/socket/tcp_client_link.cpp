@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cinttypes>
 #include <cstring>
 
 namespace esphome::socket {
@@ -17,19 +18,23 @@ static constexpr uint32_t CONNECT_TIMEOUT_MS = 10000;
 // Non-blocking options and TCP keepalive for a bridged stream socket.
 // Keepalive is best-effort: the raw lwIP implementation (ESP8266, RP2040)
 // rejects it, so a half-open link there is only detected by a failed write.
-static void set_stream_options(Socket *sock) {
+static void set_stream_options(Socket *sock, const char *tag) {
   int yes = 1;
+  // Fails only on an invalid descriptor, or on raw lwIP after a peer reset that the next read() reports.
   sock->setblocking(false);
-  sock->setsockopt(IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
-  sock->setsockopt(SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+  int err = sock->setsockopt(IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+  err |= sock->setsockopt(SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
 #ifdef TCP_KEEPIDLE
   int idle = 30;
   int interval = 10;
   int count = 3;
-  sock->setsockopt(IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
-  sock->setsockopt(IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
-  sock->setsockopt(IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
+  err |= sock->setsockopt(IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+  err |= sock->setsockopt(IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
+  err |= sock->setsockopt(IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
 #endif
+  if (err != 0) {
+    ESP_LOGV(tag, "Nodelay/keepalive not fully applied");
+  }
 }
 
 void TcpClientLink::begin(const char *tag) {
@@ -60,6 +65,7 @@ void TcpClientLink::poll_slow_() {
       break;
   }
   this->connected_ = true;
+  this->note_io();
   ESP_LOGI(this->tag_, "Connected to %s:%u", this->host_.c_str(), this->port_);
 }
 
@@ -84,7 +90,7 @@ void TcpClientLink::try_connect_() {
     this->drop_(LOG_STR("Connect failed"), errno);
     return;
   }
-  set_stream_options(this->sock_.get());
+  set_stream_options(this->sock_.get(), this->tag_);
   // Starts the pending-connect clock that poll() times out against.
   this->note_attempt();
   // An immediate success is reported by the next poll(); poll_connect() sees it writable.
@@ -95,9 +101,10 @@ void TcpClientLink::try_connect_() {
 
 void TcpClientLink::adopt(std::unique_ptr<Socket> sock) {
   this->close();
-  set_stream_options(sock.get());
+  set_stream_options(sock.get(), this->tag_);
   this->sock_ = std::move(sock);
   this->connected_ = true;
+  this->note_io();
 }
 
 ssize_t TcpClientLink::read(uint8_t *buf, size_t len) {
@@ -106,6 +113,7 @@ ssize_t TcpClientLink::read(uint8_t *buf, size_t len) {
   }
   ssize_t count = this->sock_->read(buf, len);
   if (count > 0) {
+    this->note_io();
     return count;
   }
   if (count == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
@@ -121,6 +129,9 @@ ssize_t TcpClientLink::write_(const uint8_t *buf, size_t len) {
   }
   ssize_t sent = this->sock_->write(buf, len);
   if (sent >= 0) {
+    if (sent > 0) {
+      this->note_io();
+    }
     return sent;
   }
   if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -163,6 +174,14 @@ void TcpClientLink::close() {
 
 void TcpClientLink::drop_(const LogString *what, int err) {
   ESP_LOGW(this->tag_, "%s: %d", LOG_STR_ARG(what), err);
+  this->close();
+  this->note_attempt();
+}
+
+void TcpClientLink::idle_close_() {
+  uint32_t idle = App.get_loop_component_start_time() - this->last_io_ms_;
+  // A configured close, not a failure.
+  ESP_LOGI(this->tag_, "Idle for %" PRIu32 "ms, closing", idle);
   this->close();
   this->note_attempt();
 }

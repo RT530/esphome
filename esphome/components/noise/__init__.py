@@ -1,5 +1,6 @@
 import base64
 import binascii
+import secrets
 from typing import Any
 
 import esphome.codegen as cg
@@ -10,15 +11,21 @@ from esphome.cpp_generator import MockObj
 from esphome.types import ConfigType
 
 CODEOWNERS = ["@esphome/core"]
+DOMAIN = "noise"
 
 # Keep in sync with platformio.ini and esphome/idf_component.yml.
 # LIBSODIUM_VERSION must match the version noise-c pins in its manifests.
-NOISE_C_VERSION = "0.1.30"
-LIBSODIUM_VERSION = "1.10021.11"
+NOISE_C_VERSION = "0.1.31"
+LIBSODIUM_VERSION = "1.10021.12"
 
 noise_ns = cg.esphome_ns.namespace("noise")
 
 CONFIG_SCHEMA = cv.Schema({})
+
+
+def generate_encryption_key() -> str:
+    """A fresh random key in the base64 form the yaml takes."""
+    return base64.b64encode(secrets.token_bytes(32)).decode()
 
 
 def validate_encryption_key(value: Any) -> str:
@@ -91,12 +98,11 @@ def encryption_schema(config: ConfigType | None) -> ConfigType:
     return ENCRYPTION_SCHEMA(config)
 
 
-def _use_managed_components() -> bool:
-    """Whether noise-c and libsodium come from the ESP-IDF component registry.
+def use_registry_libsodium() -> bool:
+    """Whether libsodium, and noise-c with it, come from the ESP-IDF component registry.
 
     Both build as ESP-IDF components, so on ESP32 they skip the PlatformIO library
-    converter unless arduino-esp32 bundles its own libsodium. Not toolchain
-    dependent: the PlatformIO toolchain reads the project manifest too, and every
+    converter unless arduino-esp32's own libsodium cannot be replaced. Every
     consumer of libsodium must make the same choice or a second copy appears.
     """
     if not CORE.is_esp32:
@@ -116,7 +122,7 @@ async def to_code(config: ConfigType) -> None:
     cg.add_define("USE_NOISE")
     # libsodium is declared next to noise-c so the library manager sees both up front
     # and nothing else pulls a second copy; the version must match noise-c's own pin
-    if _use_managed_components():
+    if use_registry_libsodium():
         from esphome.components.esp32 import add_idf_component
 
         add_idf_component(name="esphome/noise-c", ref=NOISE_C_VERSION)

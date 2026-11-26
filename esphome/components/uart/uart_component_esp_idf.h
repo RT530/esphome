@@ -55,7 +55,7 @@ class IDFUARTComponent final : public UARTComponent, public Component {
   /**
    * Load the UART with the current settings.
    * @param dump_config (Optional, default `true`): True for displaying new settings or
-   * false to change it quitely
+   * false to change it quietly
    *
    * Example:
    * ```cpp
@@ -86,10 +86,17 @@ class IDFUARTComponent final : public UARTComponent, public Component {
    */
   esp_err_t apply_settings_live();
 
+#ifdef USE_UART_TX_BREAK
+  bool set_tx_break(bool enable) override;
+#endif
+
   void on_shutdown() override;
 
  protected:
   void check_logger_conflict() override;
+#ifdef USE_GPIO_HOLD
+  void set_pins_hold_(bool hold);
+#endif
   uint32_t line_inversion_mask_();
   // Re-applies what uart_param_config() resets: inversion, RX threshold/timeout, mode.
   esp_err_t apply_line_settings_();
@@ -113,7 +120,10 @@ class IDFUARTComponent final : public UARTComponent, public Component {
   bool has_peek_{false};
   uint8_t peek_byte_{0};
   uint8_t clock_source_{UART_SCLK_DEFAULT};  ///< uart_sclk_t stored in a byte; the IDF values are all small.
-  uint32_t flush_timeout_ms_{0};             ///< 0 means wait indefinitely (portMAX_DELAY).
+#ifdef USE_UART_TX_BREAK
+  bool tx_break_{false};  // in the padding before flush_timeout_ms_
+#endif
+  uint32_t flush_timeout_ms_{0};  ///< 0 means wait indefinitely (portMAX_DELAY).
   size_t tx_buffer_size_{0};
 
 #ifdef USE_UART_WAKE_LOOP_ON_RX

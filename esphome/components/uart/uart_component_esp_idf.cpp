@@ -23,7 +23,7 @@
 
 namespace esphome::uart {
 
-static const char *const TAG = "uart";
+ESPHOME_LOG_TAG(TAG, "uart");
 
 /// Check if a pin number matches one of the default UART0 GPIO pins.
 /// These pins may have residual IOMUX state from the ROM bootloader that
@@ -142,7 +142,10 @@ void IDFUARTComponent::setup() {
 #else
   size_t fifo_len = SOC_UART_FIFO_LEN;
 #endif
-  if (this->rx_buffer_size_ <= fifo_len) {
+  if (this->rx_pin_ == nullptr) {
+    // Nothing arrives without an RX pin; ESP-IDF still requires more than the hardware FIFO
+    this->rx_buffer_size_ = fifo_len + 1;
+  } else if (this->rx_buffer_size_ <= fifo_len) {
     ESP_LOGW(TAG, "rx_buffer_size is too small, must be greater than %zu", fifo_len);
     this->rx_buffer_size_ = fifo_len * 2;
   }
@@ -238,6 +241,10 @@ void IDFUARTComponent::load_settings(bool dump_config) {
     this->mark_failed();
     return;
   }
+#ifdef USE_GPIO_HOLD
+  // Release held pins so the UART peripheral can drive them
+  this->set_pins_hold_(false);
+#endif
 
 #ifdef USE_UART_WAKE_LOOP_ON_RX
   // Register ISR callback to wake the main loop when UART data arrives.
@@ -263,8 +270,27 @@ uint32_t IDFUARTComponent::line_inversion_mask_() {
   if (this->flow_control_pin_ != nullptr && this->flow_control_pin_->is_inverted()) {
     invert |= UART_SIGNAL_RTS_INV;
   }
+#ifdef USE_UART_TX_BREAK
+  // the idle level of an inverted TX signal is the break level; in the mask, so a settings reload applies it again
+  if (this->tx_break_)
+    invert ^= UART_SIGNAL_TXD_INV;
+#endif
   return invert;
 }
+
+#ifdef USE_UART_TX_BREAK
+bool IDFUARTComponent::set_tx_break(bool enable) {
+  if (this->tx_pin_ == nullptr || this->is_failed())
+    return false;
+  const bool previous = this->tx_break_;
+  this->tx_break_ = enable;
+  if (uart_set_line_inverse(this->uart_num_, this->line_inversion_mask_()) == ESP_OK)
+    return true;
+  // not applied: a settings reload must not apply it later
+  this->tx_break_ = previous;
+  return false;
+}
+#endif
 
 esp_err_t IDFUARTComponent::apply_line_settings_() {
   // uart_param_config() resets these; call after every use of it.
@@ -514,7 +540,20 @@ void IDFUARTComponent::on_shutdown() {
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "uart_driver_delete failed: %s", esp_err_to_name(err));
   }
+#ifdef USE_GPIO_HOLD
+  // Hold the pins again so they keep their state through the reset
+  this->set_pins_hold_(true);
+#endif
 }
+
+#ifdef USE_GPIO_HOLD
+void IDFUARTComponent::set_pins_hold_(bool hold) {
+  for (auto *pin : {this->tx_pin_, this->rx_pin_, this->flow_control_pin_}) {
+    if (pin != nullptr)
+      pin->set_hold(hold);
+  }
+}
+#endif
 
 }  // namespace esphome::uart
 #endif  // USE_ESP32

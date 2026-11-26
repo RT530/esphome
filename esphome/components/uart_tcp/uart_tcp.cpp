@@ -1,5 +1,6 @@
 #include "uart_tcp.h"
 
+#include "esphome/core/application.h"
 #include "esphome/core/log.h"
 
 #include <algorithm>
@@ -8,33 +9,39 @@
 
 namespace esphome::uart_tcp {
 
-static const char *const TAG = "uart_tcp";
-
-// Bytes per 16 ms loop pass at 10 bits per byte: baud / 10 / 62.5.
-static constexpr uint32_t BAUD_PACE_DIVISOR = 625;
+ESPHOME_LOG_TAG(TAG, "uart_tcp");
 
 void UartTcp::setup() {
   this->link_.begin(TAG);
 #ifdef USE_SOCKET_TCP_LISTENER
   this->listener_.begin(TAG);
 #endif
-  if (this->connected_sensor_ != nullptr) {
-    this->connected_sensor_->publish_state(false);
-  }
+#ifdef USE_BINARY_SENSOR
+  PUBLISH_STATE(this->connected_binary_sensor_, false);
+#endif
+#ifdef USE_SENSOR
+  PUBLISH_STATE(this->disconnects_sensor_, 0);
+#endif
 }
 
 void UartTcp::dump_config() {
   ESP_LOGCONFIG(TAG,
                 "UART TCP:\n"
                 "  %s: %s:%u\n"
-                "  Reconnect Interval: %" PRIu32 "ms",
+                "  Reconnect Interval: %" PRIu32 "ms\n"
+                "  Timeout: %" PRIu32 "ms",
                 this->server_ ? LOG_STR_LITERAL("Listen") : LOG_STR_LITERAL("Host"),
                 this->server_ ? LOG_STR_LITERAL("*") : this->link_.host(), this->link_.port(),
-                this->link_.reconnect_interval());
+                this->link_.reconnect_interval(), this->link_.idle_timeout());
 #ifdef USE_SOCKET_TCP_LISTENER
   this->listener_.dump_config();
 #endif
-  LOG_BINARY_SENSOR("  ", "Connected", this->connected_sensor_);
+#ifdef USE_BINARY_SENSOR
+  LOG_BINARY_SENSOR("  ", "Connected", this->connected_binary_sensor_);
+#endif
+#ifdef USE_SENSOR
+  LOG_SENSOR("  ", "Disconnects", this->disconnects_sensor_);
+#endif
 }
 
 void UartTcp::on_shutdown() {
@@ -51,22 +58,26 @@ void UartTcp::sync_link_() {
     // The driver kept whatever arrived while the link was down.
     this->discard_uart_();
   }
-  if (this->connected_sensor_ != nullptr) {
-    this->connected_sensor_->publish_state(up);
+#ifdef USE_BINARY_SENSOR
+  PUBLISH_STATE(this->connected_binary_sensor_, up);
+#endif
+#ifdef USE_SENSOR
+  // Only edges get here, so down is the falling edge.
+  if (!up && this->disconnects_sensor_ != nullptr) {
+    this->disconnects_++;
+    this->disconnects_sensor_->publish_state(this->disconnects_);
   }
+#endif
 }
 
 void UartTcp::read_socket_() {
   // A hardware write blocks until the driver takes every byte. Leave what does
   // not fit in the socket, so TCP flow control throttles the peer.
-  size_t room = this->parent_->available_for_write();
-  if (room == SIZE_MAX) {
-    // Capacity unknown on this platform; pace to one loop pass of UART time
-    // (16 ms at 10 bits per byte) so a blocking write stays short.
-    room = std::max<size_t>(1, this->parent_->get_baud_rate() / BAUD_PACE_DIVISOR);
-  }
+  size_t room = this->parent_->paced_write_room(this->last_write_ms_);
   if (room == 0) {
+    // The UART cannot take more. The peer is not idle.
     this->rx_pending_ = true;
+    this->link_.note_io();
     return;
   }
   uint8_t tmp[READ_CHUNK];
@@ -81,11 +92,12 @@ void UartTcp::read_socket_() {
   }
   this->rx_pending_ = static_cast<size_t>(count) == want;
   this->write_array(tmp, static_cast<size_t>(count));
+  this->last_write_ms_ = App.get_loop_component_start_time();
 }
 
 void UartTcp::discard_uart_() {
   // Drain exactly what was buffered while the link was down; later bytes are live.
-  uint8_t dump[32];
+  uint8_t dump[DISCARD_CHUNK];
   size_t left = this->available();
   while (left != 0) {
     size_t n = std::min(left, sizeof(dump));
@@ -127,6 +139,7 @@ void UartTcp::loop() {
   // UART bytes picked up here go out in the same pass.
   this->read_uart_();
   this->link_.flush_tx();
+  this->link_.check_idle();
 }
 
 }  // namespace esphome::uart_tcp
